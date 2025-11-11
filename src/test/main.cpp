@@ -1,103 +1,125 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
 
 TFT_eSPI tft = TFT_eSPI();
-XPT2046_Touchscreen ts(21);
+SPIClass TouchSPI(HSPI);
+
+const int TFT_CS_PIN = 15;
+const int TFT_DC_PIN = 2;
+const int TFT_RST_PIN = 4;
+const int TS_CS_PIN = 21;
+const int TS_PEN_IRQ = 16;
 
 #define TS_MINX 200
 #define TS_MAXX 3900
 #define TS_MINY 200
 #define TS_MAXY 3900
-#define TFT_CS_PIN 15
 
-int currentColor = TFT_WHITE;
-int brushSize = 3;
+bool bgWhite = true;
+int lastPen = HIGH;
+int markerX = -1;
+int markerY = -1;
 
-struct Button {
-  int x, y, w, h;
-  uint16_t color;
-  const char* label;
+uint16_t touchRead12bit(uint8_t cmd) {
+    TouchSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(TS_CS_PIN, LOW);
+    TouchSPI.transfer(cmd);
+    delayMicroseconds(2);
+    uint8_t hi = TouchSPI.transfer(0x00);
+    uint8_t lo = TouchSPI.transfer(0x00);
+    digitalWrite(TS_CS_PIN, HIGH);
+    TouchSPI.endTransaction();
+    return ((((uint16_t)hi << 8) | lo) >> 3) & 0x0FFF;
+}
+
+struct RawPoint {
+    uint16_t x;
+    uint16_t y;
+    uint16_t z1;
+    uint16_t z2;
 };
 
-Button buttons[] = {
-  {10, 10, 60, 40, TFT_RED, "Red"},
-  {80, 10, 60, 40, TFT_GREEN, "Green"},
-  {150, 10, 60, 40, TFT_BLUE, "Blue"},
-  {220, 10, 60, 40, TFT_YELLOW, "Yellow"},
-  {290, 10, 60, 40, TFT_MAGENTA, "Mag"},
-  {360, 10, 60, 40, TFT_CYAN, "Cyan"},
-  {430, 10, 40, 40, TFT_WHITE, "Clr"}
-};
+RawPoint readRaw() {
+    RawPoint p;
+    p.x = touchRead12bit(0x90);
+    p.y = touchRead12bit(0xD0);
+    p.z1 = touchRead12bit(0xB0);
+    p.z2 = touchRead12bit(0xC0);
+    return p;
+}
 
-void drawUI() {
-  tft.fillScreen(TFT_BLACK);
-  for (int i = 0; i < 7; i++) {
-    tft.fillRect(buttons[i].x, buttons[i].y, buttons[i].w, buttons[i].h, buttons[i].color);
-    tft.drawRect(buttons[i].x, buttons[i].y, buttons[i].w, buttons[i].h, TFT_WHITE);
-    tft.setTextColor(i < 6 ? TFT_BLACK : TFT_BLACK, buttons[i].color);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(buttons[i].label, buttons[i].x + buttons[i].w/2, buttons[i].y + buttons[i].h/2, 2);
-  }
-  tft.drawRect(buttons[6].x, buttons[6].y, buttons[6].w, buttons[6].h, currentColor);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Touch to draw", 240, 70, 2);
+void drawBackground() {
+    if (bgWhite)
+        tft.fillScreen(TFT_WHITE);
+    else
+        tft.fillScreen(TFT_LIGHTGREY);
+    tft.setTextColor(TFT_BLACK, bgWhite ? TFT_WHITE : TFT_LIGHTGREY);
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString("SCREEN TEST", tft.width() / 2, 8, 4);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_BLACK, bgWhite ? TFT_WHITE : TFT_LIGHTGREY);
+    tft.drawString("Touch to toggle background. Valid touches show marker and coords.", 8, 30, 2);
+}
+
+void drawMarker(int x, int y) {
+    if (x < 0 || y < 0) return;
+    tft.fillCircle(x, y, 6, TFT_RED);
+    tft.drawLine(x - 12, y, x + 12, y, TFT_BLACK);
+    tft.drawLine(x, y - 12, x, y + 12, TFT_BLACK);
+    tft.setTextColor(TFT_BLACK, bgWhite ? TFT_WHITE : TFT_LIGHTGREY);
+    tft.setTextDatum(TL_DATUM);
+    char buf[32];
+    sprintf(buf, "X:%d Y:%d", x, y);
+    tft.drawString(buf, 8, tft.height() - 24, 2);
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  pinMode(16, INPUT_PULLUP);
-  pinMode(TFT_CS_PIN, OUTPUT);
-  digitalWrite(TFT_CS_PIN, HIGH);
-  SPI.begin(18, 19, 23, -1);
-  tft.init();
-  tft.setRotation(1);
-  ts.begin();
-  ts.setRotation(1);
-  drawUI();
-  Serial.println("Touch drawing ready");
+    Serial.begin(115200);
+    pinMode(TS_PEN_IRQ, INPUT_PULLUP);
+    pinMode(TFT_CS_PIN, OUTPUT);
+    pinMode(TS_CS_PIN, OUTPUT);
+    pinMode(TFT_RST_PIN, OUTPUT);
+    pinMode(TFT_DC_PIN, OUTPUT);
+    digitalWrite(TFT_CS_PIN, HIGH);
+    digitalWrite(TS_CS_PIN, HIGH);
+    digitalWrite(TFT_RST_PIN, HIGH);
+    TouchSPI.begin(14, 12, 13, -1);
+    SPI.begin(18, 19, 23, -1);
+    tft.init();
+    tft.setRotation(1);
+    drawBackground();
 }
 
 void loop() {
-  int irq = digitalRead(16);
-  if (irq == LOW) {
-    digitalWrite(TFT_CS_PIN, HIGH);
-    delay(1);
-    if (ts.touched()) {
-      TS_Point p = ts.getPoint();
-      Serial.printf("Raw: x=%d y=%d z=%d\n", p.x, p.y, p.z);
-      if (p.z > 200 && p.z < 4000 && p.x > 100 && p.y > 100) {
-        int x = map(p.x, TS_MINX, TS_MAXX, 0, tft.width() - 1);
-        int y = map(p.y, TS_MINY, TS_MAXY, 0, tft.height() - 1);
-        x = constrain(x, 0, tft.width() - 1);
-        y = constrain(y, 0, tft.height() - 1);
-        Serial.printf("Mapped: x=%d y=%d\n", x, y);
-        bool buttonPressed = false;
-        for (int i = 0; i < 7; i++) {
-          if (x >= buttons[i].x && x <= buttons[i].x + buttons[i].w &&
-              y >= buttons[i].y && y <= buttons[i].y + buttons[i].h) {
-            buttonPressed = true;
-            if (i < 6) {
-              currentColor = buttons[i].color;
-              Serial.printf("Color changed to %s\n", buttons[i].label);
-            } else {
-              drawUI();
-              Serial.println("Screen cleared");
-            }
-            delay(200);
-            break;
-          }
-        }
-        if (!buttonPressed && y > 90) {
-          tft.fillCircle(x, y, brushSize, currentColor);
-          Serial.printf("Drew at x=%d y=%d\n", x, y);
-        }
-      } else {
-        Serial.println("Touch rejected (invalid z or x/y)");
-      }
+    int pen = digitalRead(TS_PEN_IRQ);
+    if (pen == LOW && lastPen == HIGH) {
+        bgWhite = !bgWhite;
+        drawBackground();
+        markerX = -1;
+        markerY = -1;
     }
-    delay(10);
-  }
+    lastPen = pen;
+    if (pen == LOW) {
+        RawPoint p = readRaw();
+        Serial.printf("Raw: x=%u y=%u z1=%u z2=%u\n", p.x, p.y, p.z1, p.z2);
+        bool valid = p.x > 50 && p.x < 4096 && p.y > 50 && p.y < 4096;
+        if (valid) {
+            int x = map(p.x, TS_MINX, TS_MAXX, 0, tft.width() - 1);
+            int y = map(p.y, TS_MINY, TS_MAXY, 0, tft.height() - 1);
+            x = constrain(x, 0, tft.width() - 1);
+            y = tft.height() - 1 - y;  // invert Y
+            markerX = x;
+            markerY = y;
+            drawBackground();
+            drawMarker(markerX, markerY);
+            Serial.printf("Mapped: x=%d y=%d\n", markerX, markerY);
+        } else {
+            Serial.println("Touch detected but coordinates invalid");
+        }
+        delay(80);
+    } else {
+        delay(30);
+    }
 }
+
