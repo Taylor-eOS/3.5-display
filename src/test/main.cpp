@@ -21,6 +21,10 @@ int lastPen = HIGH;
 int markerX = -1;
 int markerY = -1;
 
+uint16_t avgBuffer[3][2];
+int avgIndex = 0;
+int touchSamples = 0;
+
 uint16_t touchRead12bit(uint8_t cmd) {
     TouchSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(TS_CS_PIN, LOW);
@@ -50,28 +54,13 @@ RawPoint readRaw() {
 }
 
 void drawBackground() {
-    if (bgWhite)
-        tft.fillScreen(TFT_WHITE);
-    else
-        tft.fillScreen(TFT_LIGHTGREY);
-    tft.setTextColor(TFT_BLACK, bgWhite ? TFT_WHITE : TFT_LIGHTGREY);
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
     tft.setTextDatum(TC_DATUM);
     tft.drawString("SCREEN TEST", tft.width() / 2, 8, 4);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_BLACK, bgWhite ? TFT_WHITE : TFT_LIGHTGREY);
-    tft.drawString("Touch to toggle background. Valid touches show marker and coords.", 8, 30, 2);
-}
-
-void drawMarker(int x, int y) {
-    if (x < 0 || y < 0) return;
-    tft.fillCircle(x, y, 6, TFT_RED);
-    tft.drawLine(x - 12, y, x + 12, y, TFT_BLACK);
-    tft.drawLine(x, y - 12, x, y + 12, TFT_BLACK);
-    tft.setTextColor(TFT_BLACK, bgWhite ? TFT_WHITE : TFT_LIGHTGREY);
-    tft.setTextDatum(TL_DATUM);
-    char buf[32];
-    sprintf(buf, "X:%d Y:%d", x, y);
-    tft.drawString(buf, 8, tft.height() - 24, 2);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("Draw with stylus to test. Lines persist until reset.", 8, 30, 2);
 }
 
 void setup() {
@@ -93,33 +82,57 @@ void setup() {
 
 void loop() {
     int pen = digitalRead(TS_PEN_IRQ);
-    if (pen == LOW && lastPen == HIGH) {
-        bgWhite = !bgWhite;
-        drawBackground();
-        markerX = -1;
-        markerY = -1;
-    }
+    bool newTouch = (pen == LOW && lastPen == HIGH);
     lastPen = pen;
     if (pen == LOW) {
-        RawPoint p = readRaw();
-        Serial.printf("Raw: x=%u y=%u z1=%u z2=%u\n", p.x, p.y, p.z1, p.z2);
-        bool valid = p.x > 50 && p.x < 4096 && p.y > 50 && p.y < 4096;
-        if (valid) {
-            int x = map(p.x, TS_MINX, TS_MAXX, 0, tft.width() - 1);
-            int y = map(p.y, TS_MINY, TS_MAXY, 0, tft.height() - 1);
+        if (newTouch) {
+            avgBuffer[0][0] = 0;
+            avgBuffer[0][1] = 0;
+            avgBuffer[1][0] = 0;
+            avgBuffer[1][1] = 0;
+            avgBuffer[2][0] = 0;
+            avgBuffer[2][1] = 0;
+            avgIndex = 0;
+            touchSamples = 0;
+        }
+        RawPoint raw = readRaw();
+        Serial.printf("Raw: x=%u y=%u z1=%u z2=%u\n", raw.x, raw.y, raw.z1, raw.z2);
+        avgBuffer[avgIndex][0] = raw.x;
+        avgBuffer[avgIndex][1] = raw.y;
+        avgIndex = (avgIndex + 1) % 3;
+        uint32_t sumX = 0, sumY = 0;
+        for (int i = 0; i < 3; i++) {
+            sumX += avgBuffer[i][0];
+            sumY += avgBuffer[i][1];
+        }
+        uint16_t avgX = sumX / 3;
+        uint16_t avgY = sumY / 3;
+        touchSamples++;
+        bool valid = avgX > 100 && avgX < 3950 && avgY > 100 && avgY < 3950 && raw.z1 > 100;
+        if (valid && touchSamples >= 3) {
+            int x = map(avgX, TS_MINX, TS_MAXX, 0, tft.width() - 1);
+            int y = map(avgY, TS_MINY, TS_MAXY, 0, tft.height() - 1);
             x = constrain(x, 0, tft.width() - 1);
-            y = tft.height() - 1 - y;  // invert Y
+            y = tft.height() - 1 - y;
+            if (markerX >= 0 && markerY >= 0 && (abs(x - markerX) > 1 || abs(y - markerY) > 1)) {
+                tft.drawLine(markerX, markerY, x, y, TFT_BLACK);
+            }
             markerX = x;
             markerY = y;
-            drawBackground();
-            drawMarker(markerX, markerY);
-            Serial.printf("Mapped: x=%d y=%d\n", markerX, markerY);
-        } else {
-            Serial.println("Touch detected but coordinates invalid");
+            tft.fillCircle(x, y, 3, TFT_RED);
+            static unsigned long lastPrint = 0;
+            if (millis() - lastPrint > 100) {
+                Serial.printf("Mapped: x=%d y=%d\n", x, y);
+                lastPrint = millis();
+            }
+        } else if (!valid) {
+            Serial.println("Touch detected but invalid (noise/low pressure)");
         }
-        delay(80);
+        delay(15);
     } else {
-        delay(30);
+        touchSamples = 0;
+        markerX = -1;
+        markerY = -1;
+        delay(20);
     }
 }
-
