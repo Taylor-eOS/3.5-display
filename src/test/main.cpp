@@ -11,6 +11,12 @@ const int TFT_RST_PIN = 4;
 const int TS_CS_PIN = 21;
 const int TS_PEN_IRQ = 16;
 
+const int MIN_PRESSURE = 70;
+const int MIN_RAW_COORD = 80;
+const int MAX_RAW_COORD = 3950;
+const int CONSECUTIVE_VALIDS_THRESHOLD = 3;
+const int MAX_JUMP_DISTANCE = 7;
+
 #define TS_MINX 200
 #define TS_MAXX 3900
 #define TS_MINY 200
@@ -24,6 +30,9 @@ int markerY = -1;
 uint16_t avgBuffer[3][2];
 int avgIndex = 0;
 int touchSamples = 0;
+int consecutiveValids = 0;
+int lastGoodX = -1;
+int lastGoodY = -1;
 
 uint16_t touchRead12bit(uint8_t cmd) {
     TouchSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
@@ -94,6 +103,9 @@ void loop() {
             avgBuffer[2][1] = 0;
             avgIndex = 0;
             touchSamples = 0;
+            consecutiveValids = 0;
+            lastGoodX = -1;
+            lastGoodY = -1;
         }
         RawPoint raw = readRaw();
         Serial.printf("Raw: x=%u y=%u z1=%u z2=%u\n", raw.x, raw.y, raw.z1, raw.z2);
@@ -108,29 +120,39 @@ void loop() {
         uint16_t avgX = sumX / 3;
         uint16_t avgY = sumY / 3;
         touchSamples++;
-        bool valid = avgX > 100 && avgX < 3950 && avgY > 100 && avgY < 3950 && raw.z1 > 100;
-        if (valid && touchSamples >= 3) {
-            int x = map(avgX, TS_MINX, TS_MAXX, 0, tft.width() - 1);
-            int y = map(avgY, TS_MINY, TS_MAXY, 0, tft.height() - 1);
-            x = constrain(x, 0, tft.width() - 1);
-            y = tft.height() - 1 - y;
-            if (markerX >= 0 && markerY >= 0 && (abs(x - markerX) > 1 || abs(y - markerY) > 1)) {
-                tft.drawLine(markerX, markerY, x, y, TFT_BLACK);
+        bool baseValid = avgX > MIN_RAW_COORD && avgX < MAX_RAW_COORD && avgY > MIN_RAW_COORD && avgY < MAX_RAW_COORD && raw.z1 > MIN_PRESSURE;
+        if (baseValid) {
+            consecutiveValids++;
+            int candidateX = map(avgX, TS_MINX, TS_MAXX, 0, tft.width() - 1);
+            int candidateY = map(avgY, TS_MINY, TS_MAXY, 0, tft.height() - 1);
+            candidateX = constrain(candidateX, 0, tft.width() - 1);
+            candidateY = tft.height() - 1 - candidateY;
+            bool noJump = (lastGoodX < 0) || (abs(candidateX - lastGoodX) <= MAX_JUMP_DISTANCE && abs(candidateY - lastGoodY) <= MAX_JUMP_DISTANCE);
+            if (noJump && consecutiveValids >= CONSECUTIVE_VALIDS_THRESHOLD) {
+                if (markerX >= 0 && markerY >= 0 && (abs(candidateX - markerX) > 1 || abs(candidateY - markerY) > 1)) {
+                    tft.drawLine(markerX, markerY, candidateX, candidateY, TFT_BLACK);
+                }
+                lastGoodX = candidateX;
+                lastGoodY = candidateY;
+                markerX = candidateX;
+                markerY = candidateY;
+                tft.fillCircle(candidateX, candidateY, 3, TFT_RED);
+                static unsigned long lastPrint = 0;
+                if (millis() - lastPrint > 100) {
+                    Serial.printf("Mapped: x=%d y=%d\n", candidateX, candidateY);
+                    lastPrint = millis();
+                }
+            } else if (!noJump) {
+                Serial.println("Outlier skipped: jump too large");
             }
-            markerX = x;
-            markerY = y;
-            tft.fillCircle(x, y, 3, TFT_RED);
-            static unsigned long lastPrint = 0;
-            if (millis() - lastPrint > 100) {
-                Serial.printf("Mapped: x=%d y=%d\n", x, y);
-                lastPrint = millis();
-            }
-        } else if (!valid) {
+        } else {
+            consecutiveValids = 0;
             Serial.println("Touch detected but invalid (noise/low pressure)");
         }
         delay(15);
     } else {
         touchSamples = 0;
+        consecutiveValids = 0;
         markerX = -1;
         markerY = -1;
         delay(20);
